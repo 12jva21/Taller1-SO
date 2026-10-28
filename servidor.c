@@ -4,138 +4,106 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/stat.h>
-#include <sys/types.h>
 #include <sys/ipc.h>
 #include <sys/shm.h>
+#include <semaphore.h>
+#include "comun.h"
 
-#define ARCHIVO_CSV "vehiculos.csv"
-#define FIFO_SERVIDOR "/tmp/fifo_servidor"
-#define FIFO_CLIENTE "/tmp/fifo_cliente"
-
-#define CLAVE_SHM 12345
-#define TAM_MEMORIA 8192 // 8 KB para la base de datos en RAM
-
-#define BUSCAR_POR_TIPO 1
-#define BUSCAR_POR_MARCA 2
-
-// Estructura de solicitud enviada desde clienteFifo.c
-typedef struct {
-    int tipo;               // BUSCAR_POR_TIPO o BUSCAR_POR_MARCA
-    char termino[50];       // Término a buscar
-    pid_t cliente_pid;      // PID del proceso cliente
-} Solicitud;
-
-// Función para cargar el archivo CSV a la Memoria Compartida
-int cargar_csv_en_memoria_compartida(char *mem_ptr) {
+// Función que lee directamente del DISCO (cumple sección 7 del PDF)
+void buscar_en_disco_csv(int tipo, const char *termino, char *buffer_salida, size_t max_len) {
     FILE *file = fopen(ARCHIVO_CSV, "r");
     if (!file) {
-        perror("[ERROR SERVIDOR] No se pudo abrir el archivo vehiculos.csv");
-        return -1;
+        snprintf(buffer_salida, max_len, "[ERROR SERVIDOR] No se pudo abrir el archivo CSV en disco.\n");
+        return;
     }
 
-    memset(mem_ptr, 0, TAM_MEMORIA);
-    size_t bytes_leidos = fread(mem_ptr, 1, TAM_MEMORIA - 1, file);
-    fclose(file);
-
-    printf("[SERVIDOR] Base de datos 'vehiculos.csv' cargada en Memoria Compartida (%2zd bytes).\n", bytes_leidos);
-    return 0;
-}
-
-// Función para procesar la búsqueda en el CSV y responder por la FIFO
-void procesar_busqueda_fifo(const Solicitud *sol, int fd_respuesta, const char *mem_ptr) {
-    char copia_csv[TAM_MEMORIA];
-    strncpy(copia_csv, mem_ptr, sizeof(copia_csv));
-
-    char *linea = strtok(copia_csv, "\n");
+    char linea[256];
     int coincidencias = 0;
-    char linea_resultado[256];
+    buffer_salida[0] = '\0';
 
-    while (linea != NULL) {
-        char tipo_veh[50], marca_veh[50], modelo_veh[50];
-        
-        // Parsear formato CSV esperado: Tipo,Marca,Modelo (o separado por comas/espacios)
-        if (sscanf(linea, "%49[^,],%49[^,],%49[^\n]", tipo_veh, marca_veh, modelo_veh) == 3) {
-            const char *campo_evaluar = (sol->tipo == BUSCAR_POR_TIPO) ? tipo_veh : marca_veh;
-
-            if (strcasecmp(campo_evaluar, sol->termino) == 0) {
-                snprintf(linea_resultado, sizeof(linea_resultado),
-                         "Coincidencia: [%s] %s - %s\n", tipo_veh, marca_veh, modelo_veh);
-                write(fd_respuesta, linea_resultado, strlen(linea_resultado));
+    while (fgets(linea, sizeof(linea), file)) {
+        char tipo_v[50], marca_v[50], modelo_v[50];
+        if (sscanf(linea, "%49[^,],%49[^,],%49[^\n]", tipo_v, marca_v, modelo_v) == 3) {
+            const char *evaluar = (tipo == BUSCAR_POR_TIPO) ? tipo_v : marca_v;
+            if (strcasecmp(evaluar, termino) == 0) {
+                char coincidencia[256];
+                snprintf(coincidencia, sizeof(coincidencia), "Coincidencia: [%s] %s - %s\n", tipo_v, marca_v, modelo_v);
+                strncat(buffer_salida, coincidencia, max_len - strlen(buffer_salida) - 1);
                 coincidencias++;
             }
         }
-        linea = strtok(NULL, "\n");
     }
+    fclose(file);
 
     if (coincidencias == 0) {
-        const char *msg_vacio = "No se encontraron resultados para la búsqueda solicitada.\n";
-        write(fd_respuesta, msg_vacio, strlen(msg_vacio));
+        snprintf(buffer_salida, max_len, "No se encontraron resultados en el disco.\n");
     }
 }
 
 int main(void) {
-    int shmid;
-    char *mem_compartida;
-    int fd_servidor, fd_cliente;
-    Solicitud sol;
+    printf("[SERVIDOR] Iniciando servidor con lectura en disco (CSV)...\n");
 
-    printf("==================================================\n");
-    printf("   SERVIDOR CENTRAL DE BÚSQUEDA (FIFO + SHM)      \n");
-    printf("==================================================\n");
+    // --- CONFIGURACIÓN DE MEMORIA COMPARTIDA Y SEMÁFOROS ---
+    key_t key = ftok(SHM_KEY_PATH, SHM_PROJ_ID);
+    int shmid = shmget(key, sizeof(BufferSHM), 0666 | IPC_CREAT);
+    BufferSHM *shm_ptr = (BufferSHM *)shmat(shmid, NULL, 0);
+    memset(shm_ptr, 0, sizeof(BufferSHM));
 
-    // 1. Inicializar la Memoria Compartida (SHM)
-    shmid = shmget((key_t)CLAVE_SHM, TAM_MEMORIA, 0666 | IPC_CREAT);
-    if (shmid == -1) {
-        perror("[ERROR SERVIDOR] Fallo al crear el segmento de Memoria Compartida");
-        exit(EXIT_FAILURE);
-    }
+    sem_unlink(SEM_CLIENTE_NAME);
+    sem_unlink(SEM_SERVIDOR_NAME);
 
-    mem_compartida = (char *)shmat(shmid, NULL, 0);
-    if (mem_compartida == (char *)-1) {
-        perror("[ERROR SERVIDOR] Fallo al adjuntar la Memoria Compartida");
-        exit(EXIT_FAILURE);
-    }
+    sem_t *sem_servidor = sem_open(SEM_SERVIDOR_NAME, O_CREAT, 0666, 0); // Servidor espera a 0
+    sem_t *sem_cliente = sem_open(SEM_CLIENTE_NAME, O_CREAT, 0666, 0);   // Cliente espera a 0
 
-    // 2. Cargar datos del CSV a la memoria en RAM
-    if (cargar_csv_en_memoria_compartida(mem_compartida) == -1) {
-        printf("[ADVERTENCIA] El servidor iniciará pero la memoria está vacía.\n");
-    }
-
-    // 3. Crear el canal de FIFO principal para el servidor
+    // --- CONFIGURACIÓN DE FIFO ---
     mkfifo(FIFO_SERVIDOR, 0666);
-    printf("[SERVIDOR] Escuchando peticiones en la FIFO: %s\n", FIFO_SERVIDOR);
-    printf("[SERVIDOR] Memoria compartida lista con ID: %d (Clave: %d)\n", shmid, CLAVE_SHM);
-    printf("--------------------------------------------------\n");
 
-    // 4. Bucle principal de atención de peticiones
-    while (1) {
-        // Abrir la FIFO en modo lectura (se bloquea hasta que un cliente se conecta)
-        fd_servidor = open(FIFO_SERVIDOR, O_RDONLY);
-        if (fd_servidor == -1) {
-            perror("[ERROR SERVIDOR] Error al abrir FIFO_SERVIDOR");
-            break;
+    printf("[SERVIDOR] Listo y escuchando solicitudes por FIFO y SHM (Semáforos)...\n");
+
+    // Fork para atender SHM en segundo plano y FIFO en el hilo principal
+    if (fork() == 0) {
+        // PROCESO HIJO: Atiende solicitudes por Memoria Compartida (SHM)
+        while (1) {
+            sem_wait(sem_servidor); // Espera notificación del cliente SHM
+
+            if (shm_ptr->tipo_busqueda == COMANDO_SALIR) break;
+
+            printf("[SERVIDOR-SHM] Solicitud recibida en RAM -> Buscando en Disco...\n");
+            buscar_en_disco_csv(shm_ptr->tipo_busqueda, shm_ptr->termino, shm_ptr->respuesta, sizeof(shm_ptr->respuesta));
+
+            sem_post(sem_cliente); // Avisa al cliente SHM que la respuesta está lista
         }
+        shmdt(shm_ptr);
+        exit(0);
+    }
 
-        ssize_t bytes = read(fd_servidor, &sol, sizeof(Solicitud));
-        close(fd_servidor); // Cerrar canal de recepción para la siguiente lectura
+    // PROCESO PADRE: Atiende solicitudes por FIFO
+    while (1) {
+        int fd_serv = open(FIFO_SERVIDOR, O_RDONLY);
+        if (fd_serv == -1) break;
+
+        Solicitud sol;
+        ssize_t bytes = read(fd_serv, &sol, sizeof(Solicitud));
+        close(fd_serv);
 
         if (bytes > 0) {
-            printf("[PETICIÓN FIFO RECIBIDA] Cliente PID: %d | Tipo: %d | Término: \"%s\"\n",
-                   sol.cliente_pid, sol.tipo, sol.termino);
-
-            // Responder al cliente abriendo la FIFO que creó el cliente
-            fd_cliente = open(FIFO_CLIENTE, O_WRONLY);
-            if (fd_cliente != -1) {
-                procesar_busqueda_fifo(&sol, fd_cliente, mem_compartida);
-                close(fd_cliente);
-            } else {
-                perror("[ERROR SERVIDOR] No se pudo conectar a la FIFO del cliente");
+            printf("[SERVIDOR-FIFO] Solicitud recibida -> Buscando en Disco...\n");
+            int fd_cli = open(FIFO_CLIENTE, O_WRONLY);
+            if (fd_cli != -1) {
+                char respuesta[4096];
+                buscar_en_disco_csv(sol.tipo, sol.termino, respuesta, sizeof(respuesta));
+                write(fd_cli, respuesta, strlen(respuesta));
+                close(fd_cli);
             }
         }
     }
 
-    // Limpieza de recursos al salir
-    shmdt(mem_compartida);
+    // Limpieza
+    sem_close(sem_servidor);
+    sem_close(sem_cliente);
+    sem_unlink(SEM_SERVIDOR_NAME);
+    sem_unlink(SEM_CLIENTE_NAME);
+    shmdt(shm_ptr);
     shmctl(shmid, IPC_RMID, NULL);
     unlink(FIFO_SERVIDOR);
 
