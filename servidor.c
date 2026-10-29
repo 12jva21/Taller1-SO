@@ -39,7 +39,16 @@ void buscar_en_disco_csv(int tipo, const char *termino, char *buffer_salida, siz
 
     char linea[256];
     int coincidencias = 0;
-    buffer_salida[0] = '\0';
+
+    // Reserva dinámica de memoria para acumular las coincidencias del dataset[cite: 1]
+    size_t cap_acumulada = 1024;
+    char *resultado_dinamico = (char *)malloc(cap_acumulada);
+    if (!resultado_dinamico) {
+        fclose(file);
+        snprintf(buffer_salida, max_len, "[ERROR SERVIDOR] Fallo de asignación de memoria dinámica.\n");
+        return;
+    }
+    resultado_dinamico[0] = '\0';
 
     char termino_limpio[50];
     strncpy(termino_limpio, termino, sizeof(termino_limpio) - 1);
@@ -52,7 +61,6 @@ void buscar_en_disco_csv(int tipo, const char *termino, char *buffer_salida, siz
         char id_v[20] = {0}, tipo_v[50] = {0}, marca_v[50] = {0};
         char modelo_v[50] = {0}, anio_v[20] = {0}, hp_v[20] = {0};
 
-        // Extraer las 6 columnas
         char *token = strtok(linea, ",");
         if (token) strncpy(id_v, token, sizeof(id_v) - 1);
 
@@ -75,7 +83,6 @@ void buscar_en_disco_csv(int tipo, const char *termino, char *buffer_salida, siz
         trim(marca_v);
         trim(modelo_v);
 
-        // Omitir encabezado
         if (strcasecmp(tipo_v, "Tipo") == 0 && strcasecmp(marca_v, "Marca") == 0) continue;
 
         int coincide = 0;
@@ -89,11 +96,19 @@ void buscar_en_disco_csv(int tipo, const char *termino, char *buffer_salida, siz
             char temp[256];
             snprintf(temp, sizeof(temp), "[ID: %s] Tipo: %s | Marca: %s | Modelo: %s | Año: %s | HP: %s\n", 
                      id_v, tipo_v, marca_v, modelo_v, anio_v, hp_v);
-            
-            if (strlen(buffer_salida) + strlen(temp) < max_len - 1) {
-                strcat(buffer_salida, temp);
-                coincidencias++;
+
+            // Reasignación dinámica si excede la capacidad actual[cite: 1]
+            if (strlen(resultado_dinamico) + strlen(temp) + 1 > cap_acumulada) {
+                cap_acumulada *= 2;
+                char *nuevo_ptr = (char *)realloc(resultado_dinamico, cap_acumulada);
+                if (nuevo_ptr) {
+                    resultado_dinamico = nuevo_ptr;
+                } else {
+                    break;
+                }
             }
+            strcat(resultado_dinamico, temp);
+            coincidencias++;
         }
     }
 
@@ -101,14 +116,20 @@ void buscar_en_disco_csv(int tipo, const char *termino, char *buffer_salida, siz
 
     if (coincidencias == 0) {
         snprintf(buffer_salida, max_len, "No se encontraron coincidencias para '%s'.\n", termino_limpio);
+    } else {
+        strncpy(buffer_salida, resultado_dinamico, max_len - 1);
+        buffer_salida[max_len - 1] = '\0';
     }
+
+    // Liberación explícita de memoria dinámica[cite: 1]
+    free(resultado_dinamico);
 }
 
 int main(void) {
     printf("[SERVIDOR] Iniciando servidor único con acceso directo a disco...\n");
     fflush(stdout);
 
-    // 1. Configuración SHM
+    // 1. Configuración de Memoria Compartida (SHM)
     key_t key = ftok(SHM_KEY_PATH, SHM_PROJ_ID);
     if (key == -1) {
         perror("[ERROR SERVIDOR] ftok falló");
@@ -128,7 +149,7 @@ int main(void) {
     }
     memset(shm_ptr, 0, sizeof(BufferSHM));
 
-    // 2. Semáforos POSIX
+    // 2. Semáforos POSIX[cite: 5]
     sem_unlink(SEM_CLIENTE_NAME);
     sem_unlink(SEM_SERVIDOR_NAME);
     sem_t *sem_servidor = sem_open(SEM_SERVIDOR_NAME, O_CREAT, 0666, 0);
@@ -143,6 +164,13 @@ int main(void) {
     unlink(FIFO_SERVIDOR);
     if (mkfifo(FIFO_SERVIDOR, 0666) == -1) {
         perror("[ERROR SERVIDOR] Error al crear FIFO servidor");
+    }
+
+    // Apertura única en modo O_RDWR | O_NONBLOCK para evitar pérdidas de paquetes en el FIFO
+    int fd_serv = open(FIFO_SERVIDOR, O_RDWR | O_NONBLOCK);
+    if (fd_serv == -1) {
+        perror("[ERROR SERVIDOR] No se pudo abrir FIFO_SERVIDOR");
+        exit(1);
     }
 
     printf("[SERVIDOR] Listo. Atendiendo peticiones por FIFO y SHM...\n");
@@ -161,30 +189,26 @@ int main(void) {
         }
 
         // --- B. REVISAR FIFO ---
-        int fd_serv = open(FIFO_SERVIDOR, O_RDONLY | O_NONBLOCK);
-        if (fd_serv != -1) {
-            Solicitud sol;
-            ssize_t bytes = read(fd_serv, &sol, sizeof(Solicitud));
-            close(fd_serv);
+        Solicitud sol;
+        ssize_t bytes = read(fd_serv, &sol, sizeof(Solicitud));
+        if (bytes == sizeof(Solicitud)) {
+            printf("[SERVIDOR] Consulta recibida por FIFO desde PID %d -> Buscando en Disco...\n", sol.cliente_pid);
+            fflush(stdout);
 
-            if (bytes == sizeof(Solicitud)) {
-                printf("[SERVIDOR] Consulta recibida por FIFO desde PID %d -> Buscando en Disco...\n", sol.cliente_pid);
-                fflush(stdout);
-
-                int fd_cli = open(FIFO_CLIENTE, O_WRONLY);
-                if (fd_cli != -1) {
-                    char respuesta[4096];
-                    buscar_en_disco_csv(sol.tipo, sol.termino, respuesta, sizeof(respuesta));
-                    write(fd_cli, respuesta, strlen(respuesta) + 1);
-                    close(fd_cli);
-                }
+            int fd_cli = open(FIFO_CLIENTE, O_WRONLY);
+            if (fd_cli != -1) {
+                char respuesta[4096];
+                buscar_en_disco_csv(sol.tipo, sol.termino, respuesta, sizeof(respuesta));
+                write(fd_cli, respuesta, strlen(respuesta) + 1);
+                close(fd_cli);
             }
         }
 
-        usleep(50000);
+        usleep(10000);
     }
 
-    // Limpieza
+    // Liberación y limpieza de recursos
+    close(fd_serv);
     sem_close(sem_servidor);
     sem_close(sem_cliente);
     sem_unlink(SEM_SERVIDOR_NAME);
