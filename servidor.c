@@ -12,7 +12,7 @@
 void buscar_en_disco_csv(int tipo, const char *termino, char *buffer_salida, size_t max_len) {
     FILE *file = fopen(ARCHIVO_CSV, "r");
     if (!file) {
-        snprintf(buffer_salida, max_len, "[ERROR SERVIDOR] No se pudo abrir el archivo CSV en disco.\n");
+        snprintf(buffer_salida, max_len, "[ERROR SERVIDOR] No se pudo abrir el archivo CSV (%s).\n", ARCHIVO_CSV);
         return;
     }
 
@@ -21,21 +21,40 @@ void buscar_en_disco_csv(int tipo, const char *termino, char *buffer_salida, siz
     buffer_salida[0] = '\0';
 
     while (fgets(linea, sizeof(linea), file)) {
+        // Eliminar salto de línea \r o \n al final
+        linea[strcspn(linea, "\r\n")] = 0;
+
         char tipo_v[50], marca_v[50], modelo_v[50];
-        if (sscanf(linea, "%49[^,],%49[^,],%49[^\n]", tipo_v, marca_v, modelo_v) == 3) {
-            const char *evaluar = (tipo == BUSCAR_POR_TIPO) ? tipo_v : marca_v;
-            if (strcasecmp(evaluar, termino) == 0) {
-                char coincidencia[256];
-                snprintf(coincidencia, sizeof(coincidencia), "Coincidencia: [%s] %s - %s\n", tipo_v, marca_v, modelo_v);
-                strncat(buffer_salida, coincidencia, max_len - strlen(buffer_salida) - 1);
-                coincidencias++;
+        if (sscanf(linea, "%49[^,],%49[^,],%49s", tipo_v, marca_v, modelo_v) == 3) {
+            
+            // Función auxiliar rápida para quitar espacios al inicio y final
+            char *t = tipo_v;
+            while(*t == ' ') t++;
+            char *m = marca_v;
+            while(*m == ' ') m++;
+
+            int coincide = 0;
+            if (tipo == BUSCAR_POR_TIPO && strcasecmp(t, termino) == 0) {
+                coincide = 1;
+            } else if (tipo == BUSCAR_POR_MARCA && strcasecmp(m, termino) == 0) {
+                coincide = 1;
+            }
+
+            if (coincide) {
+                char temp[256];
+                snprintf(temp, sizeof(temp), "Tipo: %s | Marca: %s | Modelo: %s\n", t, m, modelo_v);
+                if (strlen(buffer_salida) + strlen(temp) < max_len - 1) {
+                    strcat(buffer_salida, temp);
+                    coincidencias++;
+                }
             }
         }
     }
+
     fclose(file);
 
     if (coincidencias == 0) {
-        snprintf(buffer_salida, max_len, "No se encontraron resultados en el disco.\n");
+        snprintf(buffer_salida, max_len, "No se encontraron coincidencias para '%s'.\n", termino);
     }
 }
 
